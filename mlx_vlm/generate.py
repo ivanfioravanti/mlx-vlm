@@ -341,6 +341,7 @@ class GenerationResult:
     prompt_tps: float = 0.0
     generation_tps: float = 0.0
     peak_memory: float = 0.0
+    kv_cache_bytes: int = 0
 
 
 class PromptCacheState:
@@ -761,6 +762,7 @@ def stream_generate(
                 prompt_tps=prompt_tps,
                 generation_tps=(n + 1) / (time.perf_counter() - tic),
                 peak_memory=mx.get_peak_memory() / 1e9,
+                kv_cache_bytes=sum(c.nbytes for c in tracked_cache),
             )
 
         detokenizer.finalize()
@@ -774,6 +776,7 @@ def stream_generate(
             prompt_tps=prompt_tps,
             generation_tps=(n + 1) / (time.perf_counter() - tic),
             peak_memory=mx.get_peak_memory() / 1e9,
+            kv_cache_bytes=sum(c.nbytes for c in tracked_cache),
         )
 
         # Save cache state for potential reuse on next turn
@@ -894,6 +897,7 @@ def generate(
         prompt_tps=last_response.prompt_tps,
         generation_tps=last_response.generation_tps,
         peak_memory=last_response.peak_memory,
+        kv_cache_bytes=last_response.kv_cache_bytes,
     )
 
 
@@ -981,6 +985,7 @@ class BatchStats:
         generation_tps (float): The tokens-per-second for generation.
         generation_time (float): The time in seconds spent in generation .
         peak_memory (float): The peak memory used so far in GB.
+        kv_cache_bytes (int): Peak KV cache memory usage in bytes.
     """
 
     prompt_tokens: int = 0
@@ -990,6 +995,7 @@ class BatchStats:
     generation_tps: float = 0
     generation_time: float = 0
     peak_memory: float = 0
+    kv_cache_bytes: int = 0
 
 
 @dataclass
@@ -1248,6 +1254,12 @@ class BatchGenerator:
 
         self._stats.generation_tokens += len(responses)
 
+        # Track peak KV cache memory
+        if self.active_batch is not None:
+            kv_bytes = sum(c.nbytes for c in self.active_batch.cache)
+            if kv_bytes > self._stats.kv_cache_bytes:
+                self._stats.kv_cache_bytes = kv_bytes
+
         if len(responses) > 0 and self._stats.generation_tokens % 100 == 0:
             mx.clear_cache()
 
@@ -1392,6 +1404,9 @@ def batch_generate(
         total_stats.prompt_time += chunk_stats.prompt_time
         total_stats.generation_tokens += chunk_stats.generation_tokens
         total_stats.generation_time += chunk_stats.generation_time
+        total_stats.kv_cache_bytes = max(
+            total_stats.kv_cache_bytes, chunk_stats.kv_cache_bytes
+        )
 
     mx.clear_cache()
 
