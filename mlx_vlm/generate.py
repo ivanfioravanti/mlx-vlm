@@ -1219,6 +1219,13 @@ class BatchGenerator:
         batch.y, batch.logprobs = self._step(y[:, None], batch.cache)
         mx.async_eval(batch.y, batch.logprobs)
 
+        # Track peak KV cache memory before any sequences are trimmed from the
+        # batch, so the final step (which may empty ``active_batch``) is still
+        # counted and the recorded peak reflects the untrimmed cache size.
+        kv_bytes = sum(c.nbytes for c in batch.cache)
+        if kv_bytes > self._stats.kv_cache_bytes:
+            self._stats.kv_cache_bytes = kv_bytes
+
         y = y.tolist()
         toc = time.perf_counter()
         if prompt_processing:
@@ -1253,12 +1260,6 @@ class BatchGenerator:
                 self.active_batch = None
 
         self._stats.generation_tokens += len(responses)
-
-        # Track peak KV cache memory
-        if self.active_batch is not None:
-            kv_bytes = sum(c.nbytes for c in self.active_batch.cache)
-            if kv_bytes > self._stats.kv_cache_bytes:
-                self._stats.kv_cache_bytes = kv_bytes
 
         if len(responses) > 0 and self._stats.generation_tokens % 100 == 0:
             mx.clear_cache()

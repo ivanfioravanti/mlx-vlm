@@ -175,6 +175,7 @@ class TestGenerationResult:
         assert result.prompt_tps == 0.0
         assert result.generation_tps == 0.0
         assert result.peak_memory == 0.0
+        assert result.kv_cache_bytes == 0
 
     def test_with_values(self):
         result = GenerationResult(
@@ -187,6 +188,7 @@ class TestGenerationResult:
             prompt_tps=100.0,
             generation_tps=50.0,
             peak_memory=2.5,
+            kv_cache_bytes=1_048_576,
         )
         assert result.text == "Hello world"
         assert result.token == 42
@@ -197,6 +199,7 @@ class TestGenerationResult:
         assert result.prompt_tps == 100.0
         assert result.generation_tps == 50.0
         assert result.peak_memory == 2.5
+        assert result.kv_cache_bytes == 1_048_576
 
 
 class TestBatchGenerationResult:
@@ -246,6 +249,7 @@ class TestBatchStats:
         assert stats.generation_tps == 0
         assert stats.generation_time == 0
         assert stats.peak_memory == 0
+        assert stats.kv_cache_bytes == 0
 
     def test_with_values(self):
         stats = BatchStats(
@@ -256,10 +260,12 @@ class TestBatchStats:
             generation_tps=250.0,
             generation_time=0.2,
             peak_memory=4.0,
+            kv_cache_bytes=2_097_152,
         )
         assert stats.prompt_tokens == 100
         assert stats.prompt_tps == 500.0
         assert stats.generation_tokens == 50
+        assert stats.kv_cache_bytes == 2_097_152
 
 
 class TestBatchResponse:
@@ -822,12 +828,14 @@ class TestBatchStatsAggregation:
                 prompt_time=0.1,
                 generation_tokens=50,
                 generation_time=0.2,
+                kv_cache_bytes=1_000_000,
             ),
             BatchStats(
                 prompt_tokens=150,
                 prompt_time=0.15,
                 generation_tokens=75,
                 generation_time=0.3,
+                kv_cache_bytes=3_000_000,
             ),
         ]
 
@@ -836,11 +844,17 @@ class TestBatchStatsAggregation:
             total_stats.prompt_time += stats.prompt_time
             total_stats.generation_tokens += stats.generation_tokens
             total_stats.generation_time += stats.generation_time
+            total_stats.kv_cache_bytes = max(
+                total_stats.kv_cache_bytes, stats.kv_cache_bytes
+            )
 
         assert total_stats.prompt_tokens == 250
         assert total_stats.prompt_time == pytest.approx(0.25)
         assert total_stats.generation_tokens == 125
         assert total_stats.generation_time == pytest.approx(0.5)
+        # kv_cache_bytes aggregates via max across chunks, not sum — chunks
+        # are processed sequentially and each frees its cache before the next.
+        assert total_stats.kv_cache_bytes == 3_000_000
 
         # Calculate TPS
         if total_stats.prompt_time > 0:
@@ -852,6 +866,31 @@ class TestBatchStatsAggregation:
 
         assert total_stats.prompt_tps == pytest.approx(1000.0)
         assert total_stats.generation_tps == pytest.approx(250.0)
+
+    def test_kv_cache_bytes_max_aggregation(self):
+        """kv_cache_bytes across chunks takes max, and a later-smaller chunk
+        must not overwrite a larger earlier chunk."""
+        total_stats = BatchStats()
+        chunks = [
+            BatchStats(kv_cache_bytes=5_000_000),
+            BatchStats(kv_cache_bytes=2_000_000),  # smaller — must not win
+            BatchStats(kv_cache_bytes=4_500_000),
+        ]
+        for chunk in chunks:
+            total_stats.kv_cache_bytes = max(
+                total_stats.kv_cache_bytes, chunk.kv_cache_bytes
+            )
+        assert total_stats.kv_cache_bytes == 5_000_000
+
+    def test_kv_cache_bytes_zero_chunk_preserves_peak(self):
+        """A chunk reporting 0 (e.g., no generation happened) must not reset
+        an already-recorded peak."""
+        total_stats = BatchStats(kv_cache_bytes=7_500_000)
+        empty_chunk = BatchStats()
+        total_stats.kv_cache_bytes = max(
+            total_stats.kv_cache_bytes, empty_chunk.kv_cache_bytes
+        )
+        assert total_stats.kv_cache_bytes == 7_500_000
 
 
 # ============================================================================
