@@ -56,7 +56,71 @@ def _sanitize_moe_weights(weights: dict, args):
     for layer_idx in range(args.num_hidden_layers):
         prefix = f"language_model.model.layers.{layer_idx}.block_sparse_moe"
 
+        # --- Branch for ALREADY pre-stacked checkpoints (e.g. mlx-community
+        # MiniMax-M3-4bit). Here the routed experts ship as ONE 3D tensor per
+        # projection — block_sparse_moe.switch_mlp.{gate_proj,up_proj,down_proj}
+        # of shape (num_experts, out, in[_packed]) — and the shared expert ships
+        # separately as block_sparse_moe.shared_experts.{gate_proj,up_proj,
+        # down_proj} (2D: (out, in[_packed])). The per-expert experts.{N}.wK
+        # keys the loop below expects do NOT exist, so has_all() never fires and
+        # these tensors arrive at load_weights unconsumed ("Received N
+        # parameters not in model"). This branch fuses them into the packed
+        # gate_up_proj / down_proj layout the model instantiates.
+        #
+        # Axis contract (DO NOT change without re-deriving from SwitchLinear):
+        #   routed tensors are (E, out, in_packed); the quant group axis is the
+        #   LAST axis (in / group_size for scales|biases, in*bits/32 for weight)
+        #   and must stay aligned with input_dims -> NEVER concat along it.
+        #   * gate||up fuse  -> OUTPUT axis = axis 1 (3D routed) / axis 0 (2D shared)
+        #   * append shared  -> EXPERT axis = axis 0, as the LAST slot (index E)
         for suffix in ("weight", "scales", "biases", "bias"):
+            routed_gate_key = f"{prefix}.switch_mlp.gate_proj.{suffix}"
+            routed_up_key = f"{prefix}.switch_mlp.up_proj.{suffix}"
+            routed_down_key = f"{prefix}.switch_mlp.down_proj.{suffix}"
+            shared_gate_key = f"{prefix}.shared_experts.gate_proj.{suffix}"
+            shared_up_key = f"{prefix}.shared_experts.up_proj.{suffix}"
+            shared_down_key = f"{prefix}.shared_experts.down_proj.{suffix}"
+
+            prestacked = has_all([routed_gate_key, routed_up_key, routed_down_key])
+            if prestacked:
+                if pack_shared and has_all(
+                    [shared_gate_key, shared_up_key, shared_down_key]
+                ):
+                    # gate_up: fuse routed gate||up along OUTPUT axis (axis 1 of
+                    # the 3D (E, out, in) tensor), then append the shared expert
+                    # (its own gate||up fused along axis 0, the 2D output axis)
+                    # as the last slot along the EXPERT axis (axis 0).
+                    routed_gate = weights.pop(routed_gate_key)
+                    routed_up = weights.pop(routed_up_key)
+                    routed_gate_up = mx.concatenate(
+                        [routed_gate, routed_up], axis=1
+                    )
+                    shared_gate = weights.pop(shared_gate_key)
+                    shared_up = weights.pop(shared_up_key)
+                    shared_gate_up = mx.expand_dims(
+                        mx.concatenate([shared_gate, shared_up], axis=0), axis=0
+                    )
+                    weights[f"{prefix}.switch_mlp.gate_up_proj.{suffix}"] = (
+                        mx.concatenate([routed_gate_up, shared_gate_up], axis=0)
+                    )
+
+                    routed_down = weights.pop(routed_down_key)
+                    shared_down = mx.expand_dims(
+                        weights.pop(shared_down_key), axis=0
+                    )
+                    weights[f"{prefix}.switch_mlp.down_proj.{suffix}"] = (
+                        mx.concatenate([routed_down, shared_down], axis=0)
+                    )
+                else:
+                    # No shared-expert packing: just fuse routed gate||up along
+                    # the OUTPUT axis (axis 1). down_proj is already correct.
+                    routed_gate = weights.pop(routed_gate_key)
+                    routed_up = weights.pop(routed_up_key)
+                    weights[f"{prefix}.switch_mlp.gate_up_proj.{suffix}"] = (
+                        mx.concatenate([routed_gate, routed_up], axis=1)
+                    )
+                continue
+
             if pack_shared:
                 gate_keys = expert_keys(prefix, "w1", suffix)
                 up_keys = expert_keys(prefix, "w3", suffix)
