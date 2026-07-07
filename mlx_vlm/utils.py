@@ -564,10 +564,14 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         config["quantization"] = transformed_quantization
         config["quantization_config"] = transformed_quantization
 
-    if not is_mlx_format:
-        # Sanitize weights
-        weights = sanitize_weights(model, weights)
+    # Always run the model's own sanitize(): it's a no-op for checkpoints that
+    # already match the model, but some mlx-format quants (e.g. MiniMax-M3-4bit)
+    # ship a MoE expert layout (pre-stacked switch_mlp + separate shared_experts)
+    # that still must be fused into gate_up_proj. Sub-model sanitizes below stay
+    # gated to non-mlx-format conversions.
+    weights = sanitize_weights(model, weights)
 
+    if not is_mlx_format:
         if hasattr(model, "thinker") and hasattr(model.thinker, "sanitize"):
             weights = sanitize_weights(model.thinker, weights)
             weights = sanitize_weights(model.thinker.vision_tower, weights)
