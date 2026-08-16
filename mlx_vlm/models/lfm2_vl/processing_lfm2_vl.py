@@ -876,6 +876,13 @@ def _patched_call(self, images=None, text=None, **kwargs):
 
     return_tensors = output_kwargs["text_kwargs"].pop("return_tensors", None)
 
+    if len(expanded_text) > 1:
+        # Batched prompts have different token counts; pad to the longest so
+        # input_ids/attention_mask come back rectangular.
+        output_kwargs["text_kwargs"]["padding"] = "longest"
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
     text_inputs = self.tokenizer(expanded_text, **output_kwargs["text_kwargs"])
     inputs.update(text_inputs)
 

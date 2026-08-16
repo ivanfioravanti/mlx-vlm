@@ -1808,12 +1808,21 @@ def prepare_inputs(
         image_processor = (
             processor.image_processor if hasattr(processor, "image_processor") else None
         )
-        images = [process_image(img, resize_shape, image_processor) for img in images]
+        nested_images = any(isinstance(img, (list, tuple)) for img in images)
+        if nested_images:
+            # Per-prompt image groups: keep the nesting so processors see
+            # exactly one image per sample.
+            images = [
+                [process_image(img, resize_shape, image_processor) for img in sub]
+                for sub in images
+            ]
+        else:
+            images = [process_image(img, resize_shape, image_processor) for img in images]
 
         # For batching, we need uniform image sizes. Instead of padding to the
         # largest image (which adds white borders that hurt accuracy), we resize
         # all images to the model's expected input size.
-        if len(images) > 1 and pad_to_uniform_size:
+        if len(images) > 1 and pad_to_uniform_size and not nested_images:
             # Get target size from image processor if available
             target_size = None
             if image_processor is not None and hasattr(image_processor, "size"):

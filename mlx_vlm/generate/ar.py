@@ -3104,6 +3104,18 @@ def _generate_batch(
     batch_size = len(prompts)
     logits_processors = kwargs.pop("logits_processors", None)
 
+    if images is not None and not isinstance(images, list):
+        images = [images]
+    # One image per prompt arriving flat (batch_generate's shape groups):
+    # nest it so processors count one image per sample instead of reading the
+    # whole group as a single multi-image prompt.
+    if (
+        images is not None
+        and len(images) == len(prompts)
+        and not any(isinstance(img, (list, tuple)) for img in images)
+    ):
+        images = [[img] for img in images]
+
     num_images_list = [
         1 if i < (len(images) if images is not None else 0) else 0
         for i in range(len(prompts))
