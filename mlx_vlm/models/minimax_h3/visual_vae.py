@@ -568,9 +568,11 @@ class MiniMaxH3VideoVAE(nn.Module):
             self.tile_sample_min_width,
             self.tile_sample_min_overlap_width,
         )
-        tiles = [
-            [
-                self.quant_conv(
+        tiles = []
+        for y_start, y_length in zip(y_starts, y_lengths):
+            row = []
+            for x_start, x_length in zip(x_starts, x_lengths):
+                tile = self.quant_conv(
                     self.encoder(
                         hidden_states[
                             ...,
@@ -579,10 +581,10 @@ class MiniMaxH3VideoVAE(nn.Module):
                         ]
                     )
                 )
-                for x_start, x_length in zip(x_starts, x_lengths)
-            ]
-            for y_start, y_length in zip(y_starts, y_lengths)
-        ]
+                # Bound the lazy graph: large images split into hundreds of tiles.
+                mx.eval(tile)
+                row.append(tile)
+            tiles.append(row)
         ratio = self.config.spatial_compression_ratio
         return self._stitch_tiles(
             tiles,
