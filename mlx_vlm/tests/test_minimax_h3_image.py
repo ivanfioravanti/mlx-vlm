@@ -510,6 +510,96 @@ def test_native_edit_presentation_and_frozen_reference_rows(monkeypatch):
         assert_array_equal(np.array(indices), [0] * 11 + [1] * 8 + [0] * 4)
 
 
+def test_flow_schedule_and_lora_adapter(tmp_path):
+    from mlx import nn
+
+    from mlx_vlm.models.minimax_h3_image.lora import apply_lora
+    from mlx_vlm.models.minimax_h3_image.packing import flow_schedule
+
+    assert_allclose(flow_schedule(2), [1.0, 12 * 0.5 / 6.5, 0.0], rtol=1e-6)
+    assert flow_schedule(4, shift=1.0) == [1.0, 0.75, 0.5, 0.25, 0.0]
+    model = MiniMaxH3ImageTransformer(_transformer_config())
+    nn.quantize(
+        model, group_size=32, bits=8, class_predicate=lambda p, m: p.endswith("to_q")
+    )
+    model.proj_out = model.pdd_proj_out[0]
+    inputs = _inputs()
+    baseline = model(**inputs, pdd_step_index=None)
+    assert_array_equal(np.array(baseline), np.array(model(**inputs, pdd_step_index=0)))
+    targets = {
+        "transformer_blocks.0.attn.to_q": (32, 32),
+        "transformer_blocks.1.attn.to_out.0": (32, 32),
+        "transformer_blocks.1.ff.net.0.proj": (128, 32),
+        "token_refiner.refiner_blocks.0.ff.net.2": (32, 64),
+    }
+    lora = {}
+    for name, (out, inp) in targets.items():
+        lora[f"transformer.{name}.lora_A.weight"] = mx.random.normal((4, inp)) * 0.1
+        lora[f"transformer.{name}.lora_B.weight"] = mx.random.normal((out, 4)) * 0.1
+    plain = model.transformer_blocks[1].attn.to_out[0]
+    fused = plain.weight + 0.5 * (
+        lora["transformer.transformer_blocks.1.attn.to_out.0.lora_B.weight"]
+        @ lora["transformer.transformer_blocks.1.attn.to_out.0.lora_A.weight"]
+    )
+    path = tmp_path / "lora.safetensors"
+    mx.save_safetensors(str(path), lora)
+    assert apply_lora(model, path, scale=0.5) == len(targets)
+    x = mx.random.normal((1, 3, 32))
+    assert_allclose(
+        np.array(model.transformer_blocks[1].attn.to_out[0](x)),
+        np.array(x @ fused.T),
+        atol=1e-5,
+    )
+    changed = model(**inputs, pdd_step_index=None)
+    assert not np.allclose(np.array(changed), np.array(baseline))
+    mx.save_safetensors(
+        str(path), {"transformer.missing.lora_A.weight": mx.zeros((1, 1))}
+    )
+    with pytest.raises(ValueError, match="No LoRA weights"):
+        apply_lora(model, path)
+    with pytest.raises(ValueError, match="org/repo/file"):
+        apply_lora(model, "not-a-file")
+
+
+def test_flow_sampling_with_init_image(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    _write_source(source)
+
+    def attach(transformer):
+        transformer.proj_out = transformer.pdd_proj_out[0]
+
+    monkeypatch.setattr(pipeline_module, "load_flow_head", attach)
+    model = load_image_generation_model(str(source), upsample_prompt=False)
+    options = dict(width=64, height=64, seed=7, min_generation_area=1024)
+    stock = generate_image(model, "a teapot", **options)
+    assert not model.pipeline.transformer.adaln_weights_available
+    # Explicit sigmas switch to the base head and reload the dropped AdaLN weights.
+    flow = generate_image(model, "a teapot", steps=2, sigmas=[1.0, 0.5, 0.0], **options)
+    assert flow.steps == 2 and flow.array.shape == (64, 64, 3)
+    assert model.pipeline.transformer.adaln_weights_available
+    assert not np.array_equal(np.array(flow.array), np.array(stock.array))
+    refined = generate_image(
+        model,
+        "a teapot",
+        steps=1,
+        sigmas=[0.5, 0.0],
+        init_image=Image.fromarray(np.array(flow.array)),
+        **options,
+    )
+    assert refined.array.shape == (64, 64, 3)
+    pipeline = model.pipeline
+    for bad in ([1.0, 1.0, 0.0], [1.0, 0.5], [1.5, 0.0], [0.0]):
+        with pytest.raises(ValueError, match="sigmas"):
+            pipeline.generate_array("a teapot", sigmas=bad)
+    with pytest.raises(ValueError, match="init_image"):
+        pipeline.generate_array("a teapot", init_image="x.png")
+    transformer = pipeline.transformer
+    pipeline.load_lora(None)
+    assert pipeline._transformer is transformer
+    pipeline.load_lora("org/repo/lora.safetensors")
+    assert pipeline._transformer is None
+
+
 @pytest.mark.parametrize("quantize", [False, True])
 def test_conversion_strict_reload_and_generation(tmp_path, quantize):
     source, converted = tmp_path / "source", tmp_path / "mlx"

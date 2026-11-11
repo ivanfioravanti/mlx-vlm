@@ -10,10 +10,12 @@ from PIL import Image
 
 from ..minimax_h3.packing import patchify_video_latents, unpatchify_video_tokens
 from ..minimax_h3.processing import decode_image, process_qwen_images, resize_lanczos
+from .lora import apply_lora, load_flow_head
 from .packing import (
     bound_short_edge,
     build_image_layout,
     canvas_size,
+    flow_schedule,
     sampling_schedule,
 )
 from .upsampler import DEFAULT_UPSAMPLER, MiniMaxH3PromptUpsampler
@@ -32,8 +34,11 @@ class MiniMaxH3ImagePipeline:
         upsample_prompt=True,
         prompt_expansion_model=DEFAULT_UPSAMPLER,
         evict_upsampler=True,
+        lora_path=None,
+        lora_scale=1.0,
     ):
         self.model_path = Path(model_path)
+        self.lora_path, self.lora_scale = lora_path, lora_scale
         self.evict_text_encoder = evict_text_encoder
         self._conditioner = self._transformer = self._vae = None
         self._adaln_caches = None
@@ -108,7 +113,17 @@ class MiniMaxH3ImagePipeline:
     def transformer(self):
         if self._transformer is None:
             self._transformer = load_transformer(self.model_path)
+            if self.lora_path is not None:
+                apply_lora(self._transformer, self.lora_path, self.lora_scale)
         return self._transformer
+
+    def load_lora(self, lora_path, lora_scale=1.0):
+        """Select a few-step LoRA (or None). A change reloads the transformer."""
+        if (lora_path, lora_scale) != (self.lora_path, self.lora_scale):
+            self.lora_path, self.lora_scale = lora_path, lora_scale
+            self._transformer = self._adaln_caches = None
+            gc.collect()
+            mx.clear_cache()
 
     def _encode_prompt(self, prompt, images, max_sequence_length):
         if self._conditioner is None:
@@ -171,13 +186,33 @@ class MiniMaxH3ImagePipeline:
         max_sequence_length=4096,
         upsample_prompt=None,
         prompt_expansion_model=None,
+        shift=12.0,
+        sigmas=None,
+        init_image=None,
     ):
         if not isinstance(prompt, str) or not prompt:
             raise ValueError("H3-Image requires a non-empty prompt")
-        if steps != 6 or guidance != 1:
+        # A few-step LoRA or an explicit schedule replaces the six step-distilled
+        # PDD heads with plain flow matching on the checkpoint's base head.
+        flow = self.lora_path is not None or sigmas is not None
+        if guidance != 1 or (not flow and steps != 6):
             raise ValueError(
-                "H3-Image is distilled for exactly six steps and guidance 1"
+                "H3-Image is distilled for exactly six steps and guidance 1; "
+                "other step counts need a few-step LoRA or explicit sigmas"
             )
+        if init_image is not None and not flow:
+            raise ValueError("init_image needs a few-step LoRA or explicit sigmas")
+        if flow:
+            sigmas = list(flow_schedule(steps, shift) if sigmas is None else sigmas)
+            if (
+                len(sigmas) < 2
+                or sigmas[0] > 1
+                or sigmas[-1] != 0
+                or any(b >= a for a, b in zip(sigmas, sigmas[1:]))
+            ):
+                raise ValueError(
+                    "sigmas must strictly decrease from at most 1.0 down to 0.0"
+                )
         if not 1 <= max_sequence_length <= 4096:
             raise ValueError("max_sequence_length must be between 1 and 4096")
         if len(image_paths) > 16:
@@ -229,6 +264,12 @@ class MiniMaxH3ImagePipeline:
                 z = (z - mean) / std
                 mx.eval(z)
                 reference_latents.append(z)
+        if flow and self._transformer is not None:
+            if not self._transformer.adaln_weights_available:
+                # Six-step sampling dropped the AdaLN projections; flow needs them.
+                self._transformer = self._adaln_caches = None
+                gc.collect()
+                mx.clear_cache()
         transformer = self.transformer
         config = transformer.config
         # The released image VAE compresses each spatial axis by sixteen.
@@ -242,6 +283,21 @@ class MiniMaxH3ImagePipeline:
         )
         positions, tags, image_indices, text_indices, reference_rows = layout
         noise = mx.random.normal((1, config.in_channels, 1, lh, lw), key=random_key())
+        if init_image is not None:
+            # Image-to-image: start from the encoded image noised to sigmas[0].
+            vae = self.vae
+            pixels = resize_lanczos(
+                decode_image(init_image), canvas_height, canvas_width
+            )
+            pixels = (
+                (pixels.astype(mx.float32) / 255 - mx.array(PIXEL_MEAN))
+                / mx.array(PIXEL_STD)
+            ).transpose(2, 0, 1)[None]
+            z = vae.encode(pixels).mode().astype(mx.float32)
+            z = (z - mx.array(vae.config.latents_mean).reshape(1, -1, 1, 1)) / mx.array(
+                vae.config.latents_std
+            ).reshape(1, -1, 1, 1)
+            noise = (1 - sigmas[0]) * z[:, :, None] + sigmas[0] * noise
         target = patchify_video_latents(noise, config.patch_size)
         references = []
         for z in reference_latents:
@@ -253,9 +309,18 @@ class MiniMaxH3ImagePipeline:
                 )
             )
         rows = mx.concatenate([*references, target], axis=0)
-        timesteps, sigmas = sampling_schedule()
+        if flow:
+            sigmas = mx.array(sigmas, mx.float32)
+            timesteps = 1 - sigmas[:-1]
+            if transformer.proj_out is None:
+                load_flow_head(transformer)
+        else:
+            timesteps, sigmas = sampling_schedule()
         tables = [mx.stack([t, mx.array(0.999, mx.float32)]) for t in timesteps]
-        if self._adaln_caches is None:
+        if flow:
+            # Arbitrary schedules project AdaLN live, so the weights stay loaded.
+            heads, caches = [None] * len(tables), [None] * len(tables)
+        elif self._adaln_caches is None:
             # The schedule never changes. Materialize the tiny timestep tables once,
             # then release ~26 GB of raw AdaLN projection weights.
             self._adaln_caches = [
@@ -264,10 +329,12 @@ class MiniMaxH3ImagePipeline:
             transformer.drop_adaln_weights()
             gc.collect()
             mx.clear_cache()
+        if not flow:
+            heads, caches = range(6), self._adaln_caches
         row_indices = mx.zeros((tags.shape[0],), mx.int32)
         if reference_rows:
             row_indices = row_indices.at[image_indices[:reference_rows]].add(1)
-        for step in range(6):
+        for step in range(len(tables)):
             velocity = transformer(
                 rows[None],
                 hidden,
@@ -277,8 +344,8 @@ class MiniMaxH3ImagePipeline:
                 positions,
                 image_indices,
                 text_indices,
-                step,
-                self._adaln_caches[step],
+                heads[step],
+                caches[step],
             )[0]
             target = rows[reference_rows:] + (
                 sigmas[step] - sigmas[step + 1]

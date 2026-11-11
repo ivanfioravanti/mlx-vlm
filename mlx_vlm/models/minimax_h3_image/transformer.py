@@ -37,6 +37,8 @@ class MiniMaxH3ImageTransformer(MiniMaxH3Transformer):
             nn.Linear(config.hidden_size, config.video_patch_dim)
             for _ in range(config.num_pdd_heads)
         ]
+        # Base flow head for few-step sampling; attached by lora.load_flow_head.
+        self.proj_out = None
         self._adaln_cache_token = object()
 
     def __call__(
@@ -52,8 +54,14 @@ class MiniMaxH3ImageTransformer(MiniMaxH3Transformer):
         pdd_step_index,
         adaln_cache=None,
     ):
-        if not 0 <= pdd_step_index < len(self.pdd_proj_out):
+        if pdd_step_index is None:
+            if self.proj_out is None:
+                raise RuntimeError("Load the base flow head before flow sampling")
+            head = self.proj_out
+        elif not 0 <= pdd_step_index < len(self.pdd_proj_out):
             raise ValueError("pdd_step_index must select one of the six output heads")
+        else:
+            head = self.pdd_proj_out[pdd_step_index]
         length = position_ids.shape[0]
         if (
             position_ids.shape != (length, 3)
@@ -109,6 +117,5 @@ class MiniMaxH3ImageTransformer(MiniMaxH3Transformer):
             else adaln_cache.output_modulation
         )
         packed = self.norm_out.apply(packed, modulation, timestep_indices)
-        head = self.pdd_proj_out[pdd_step_index]
         # Only image rows are projected; text rows never contribute to the output.
         return head(mx.take(packed, image_indices, axis=1).astype(head.weight.dtype))

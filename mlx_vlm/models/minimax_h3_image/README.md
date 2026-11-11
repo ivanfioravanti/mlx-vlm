@@ -106,10 +106,51 @@ The standalone class also accepts `max_tokens` (4096 by default, including
 thinking) and `reasoning_effort` (`xhigh`, `medium`, or `low`). Truncated or
 invalid answers raise an error before image generation starts.
 
+## Few-step LoRA
+
+A few-step distillation LoRA in diffusers/PEFT layout, such as
+[pDMD 2-NFE](https://huggingface.co/pdmd2026/pdmd_2NFE_lora), replaces the fixed
+six-step schedule with plain flow matching: `steps` evaluations on a shifted
+grid of `steps + 1` sigmas (shift 12 by default). The LoRA runs as low-rank
+adapters beside the frozen weights, so it also works with the quantized
+checkpoints. Pass a local `.safetensors` file or `org/repo/file.safetensors`:
+
+```sh
+mlx_vlm.generate --output-modality image \
+  --model nativ-community/MiniMax-H3-Image-8bit \
+  --prompt "A red ceramic teapot on a wooden table beside a sunlit window, soft morning light, detailed natural textures" \
+  --steps 2 --size 2048x2048 --seed 42 --output teapot.png \
+  --gen-kwargs '{"lora_path":"pdmd2026/pdmd_2NFE_lora/lora_model_0.safetensors","upsample_prompt":false}'
+```
+
+```python
+model = load_image_generation_model(
+    "nativ-community/MiniMax-H3-Image-8bit",
+    lora_path="pdmd2026/pdmd_2NFE_lora/lora_model_0.safetensors",
+    upsample_prompt=False,
+)
+draft = generate_image(model, prompt, steps=2, width=1024, height=1024,
+                       min_generation_area=1024)
+```
+
+Flow sampling uses the checkpoint's base output head rather than the six
+step-distilled heads. The MLX and diffusers layouts do not ship it, so its two
+small tensors are range-read from the official checkpoint on first use and
+cached under `$HF_HOME/mlx_vlm/`.
+
+Further generation options, each of which selects flow sampling:
+
+- `shift`: the schedule shift for `steps` (12 by default).
+- `sigmas`: an explicit strictly decreasing schedule ending at 0.
+- `init_image`: image-to-image. The image is resized to the canvas, encoded and
+  noised to `sigmas[0]`, so a schedule that starts below 1 keeps its
+  composition. For example, a detail pass over an upscaled draft:
+  `init_image=draft, sigmas=[0.7, 0.66, 0.513, 0.0]`.
+
 ## Settings
 
-- Sampling is fixed at **6 steps, guidance 1**. Other values and negative
-  prompts are rejected.
+- Sampling is fixed at **6 steps, guidance 1**, unless a few-step LoRA or
+  explicit sigmas are used. Other values and negative prompts are rejected.
 - With prompt expansion disabled, use detailed English descriptions.
 - Prompts are truncated to 4096 tokens, without a chat template.
 - The model works best near 16 megapixels. Small requests are generated on

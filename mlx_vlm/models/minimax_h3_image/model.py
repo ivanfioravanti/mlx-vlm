@@ -61,7 +61,13 @@ class MiniMaxH3ImageGenerationModel(ImageGenerationModel):
         evict = kwargs.pop("evict_text_encoder", True)
         expansion = {
             name: kwargs.pop(name)
-            for name in ("upsample_prompt", "prompt_expansion_model", "evict_upsampler")
+            for name in (
+                "upsample_prompt",
+                "prompt_expansion_model",
+                "evict_upsampler",
+                "lora_path",
+                "lora_scale",
+            )
             if name in kwargs
         }
         if kwargs:
@@ -88,11 +94,21 @@ class MiniMaxH3ImageGenerationModel(ImageGenerationModel):
             "max_sequence_length",
             "upsample_prompt",
             "prompt_expansion_model",
+            "shift",
+            "sigmas",
+            "init_image",
+            "lora_path",
+            "lora_scale",
         }
         unexpected = set(request.extra) - allowed
         if unexpected:
             raise ValueError(
                 f"Unsupported H3-Image options: {', '.join(sorted(unexpected))}"
+            )
+        extra = dict(request.extra)
+        if "lora_path" in extra:
+            self.pipeline.load_lora(
+                extra.pop("lora_path"), extra.pop("lora_scale", 1.0)
             )
         seed = 0 if request.seed is None else request.seed
         steps = request.resolve_steps(6)
@@ -107,7 +123,7 @@ class MiniMaxH3ImageGenerationModel(ImageGenerationModel):
             guidance=guidance,
             width=width,
             height=height,
-            **request.extra,
+            **extra,
         )
         return ImageGenerationResult(
             array=array,

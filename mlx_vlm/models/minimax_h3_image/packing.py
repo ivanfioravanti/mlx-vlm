@@ -22,6 +22,14 @@ def sampling_schedule():
     return timesteps, mx.concatenate([1 - timesteps, mx.zeros((1,))])
 
 
+def flow_schedule(steps, shift=12.0):
+    """Shifted flow-matching sigmas: ``steps`` evaluations on ``steps + 1`` points."""
+    if steps < 1 or shift <= 0:
+        raise ValueError("Flow sampling needs at least one step and a positive shift")
+    base = np.linspace(1.0, 0.0, steps + 1, dtype=np.float32)
+    return (np.float32(shift) * base / (1 + np.float32(shift - 1) * base)).tolist()
+
+
 def canvas_size(width, height, min_generation_area=4194304):
     if width <= 0 or height <= 0:
         raise ValueError("Image width and height must be positive")
